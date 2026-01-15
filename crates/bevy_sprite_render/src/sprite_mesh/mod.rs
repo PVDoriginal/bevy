@@ -1,16 +1,16 @@
 use bevy_app::{Plugin, Update};
+use bevy_asset::{Assets, Handle};
 use bevy_ecs::{
     entity::Entity,
     query::{Added, Changed, Or},
     schedule::IntoScheduleConfigs,
     system::{Commands, Local, Query, Res, ResMut},
 };
-
-use bevy_asset::{Assets, Handle};
+use tracing::error;
 
 use bevy_image::TextureAtlasLayout;
 use bevy_math::{primitives::Rectangle, vec2};
-use bevy_mesh::{Mesh, Mesh2d};
+use bevy_mesh::{Mesh, Mesh2d, MeshTag};
 
 use bevy_platform::collections::HashMap;
 use bevy_sprite::{prelude::SpriteMesh, Anchor};
@@ -42,9 +42,11 @@ fn add_mesh(
         *quad = Some(meshes.add(Rectangle::from_size(vec2(1.0, 1.0))));
     }
     for entity in sprites {
-        commands
-            .entity(entity)
-            .insert(Mesh2d(quad.clone().unwrap()));
+        if let Some(quad) = &*quad {
+            commands.entity(entity).insert(Mesh2d(quad.clone()));
+        } else {
+            error!("Cannot find quad handle for SpriteMesh!");
+        }
     }
 }
 
@@ -59,33 +61,37 @@ fn add_material(
         Or<(Changed<SpriteMesh>, Changed<Anchor>, Added<Mesh2d>)>,
     >,
     texture_atlas_layouts: Res<Assets<TextureAtlasLayout>>,
-    mut cached_materials: Local<HashMap<(SpriteMesh, Anchor), Handle<SpriteMaterial>>>,
+    mut cached_materials: Local<HashMap<SpriteMaterial, Handle<SpriteMaterial>>>,
     mut materials: ResMut<Assets<SpriteMaterial>>,
     mut commands: Commands,
 ) {
     for (entity, sprite, anchor) in sprites {
-        if let Some(handle) = cached_materials.get(&(sprite.clone(), *anchor)) {
+        let mut material = SpriteMaterial::from_sprite_mesh(sprite.clone());
+        material.anchor = **anchor;
+
+        if let Some(texture_atlas) = &sprite.texture_atlas
+            && let Some(texture_atlas_layout) = texture_atlas_layouts.get(texture_atlas.layout.id())
+        {
+            material.texture_atlas_layout = Some(texture_atlas_layout.clone());
+        }
+
+        if let Some(handle) = cached_materials.get(&material) {
             commands
                 .entity(entity)
                 .insert(MeshMaterial2d(handle.clone()));
         } else {
-            let mut material = SpriteMaterial::from_sprite_mesh(sprite.clone());
-            material.anchor = **anchor;
-
-            if let Some(texture_atlas) = &sprite.texture_atlas
-                && let Some(texture_atlas_layout) =
-                    texture_atlas_layouts.get(texture_atlas.layout.id())
-            {
-                material.texture_atlas_layout = Some(texture_atlas_layout.clone());
-                material.texture_atlas_index = texture_atlas.index;
-            }
-
-            let handle = materials.add(material);
-            cached_materials.insert((sprite.clone(), *anchor), handle.clone());
+            let handle = materials.add(material.clone());
+            cached_materials.insert(material, handle.clone());
 
             commands
                 .entity(entity)
                 .insert(MeshMaterial2d(handle.clone()));
+        }
+
+        if let Some(atlas) = &sprite.texture_atlas {
+            commands.entity(entity).insert(MeshTag(atlas.index as u32));
+        } else {
+            commands.entity(entity).insert(MeshTag(u32::MAX));
         }
     }
 }

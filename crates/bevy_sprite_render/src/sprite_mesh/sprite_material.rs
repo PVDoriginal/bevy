@@ -1,16 +1,26 @@
 use core::f32;
+use std::array;
 
 use bevy_app::Plugin;
 use bevy_color::{Color, ColorToComponents};
+use bevy_ecs::system::lifetimeless::SRes;
 use bevy_image::{Image, TextureAtlas, TextureAtlasLayout};
 use bevy_math::{vec2, Affine2, Mat3, Rect, Vec2, Vec4};
 
 use bevy_asset::{embedded_asset, embedded_path, Asset, AssetApp, AssetPath, Handle};
 
-use bevy_reflect::Reflect;
+use bevy_reflect::{PartialReflect, Reflect};
 use bevy_render::{
     render_asset::RenderAssets,
-    render_resource::{AsBindGroup, AsBindGroupShaderType, ShaderType},
+    render_resource::{
+        binding_types::{sampler, texture_2d, uniform_buffer},
+        AsBindGroup, AsBindGroupError, AsBindGroupShaderType, BindGroupEntries,
+        BindGroupLayoutDescriptor, BindGroupLayoutEntries, BindGroupLayoutEntry, BindingResources,
+        GpuArrayBuffer, PreparedBindGroup, SamplerBindingType, SamplerDescriptor, ShaderStages,
+        ShaderType, TextureSampleType, UniformBuffer, UnpreparedBindGroup,
+    },
+    renderer::{RenderDevice, RenderQueue},
+    texture::GpuImage,
 };
 use bevy_shader::ShaderRef;
 use bevy_sprite::{
@@ -31,14 +41,10 @@ impl Plugin for SpriteMaterialPlugin {
     }
 }
 
-#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default, PartialEq)]
+#[derive(Asset, Reflect, Debug, Clone, Default, PartialEq)]
 #[reflect(Debug, Clone)]
-#[uniform(0, SpriteMaterialUniform)]
 pub struct SpriteMaterial {
-    #[texture(1)]
-    #[sampler(2)]
     pub image: Handle<Image>,
-    pub texture_atlas: Option<TextureAtlas>,
     pub color: Color,
     pub flip_x: bool,
     pub flip_y: bool,
@@ -48,7 +54,23 @@ pub struct SpriteMaterial {
     pub alpha_mode: AlphaMode2d,
     pub anchor: Vec2,
     pub texture_atlas_layout: Option<TextureAtlasLayout>,
-    pub texture_atlas_index: usize,
+}
+
+impl Eq for SpriteMaterial {}
+
+impl Hash for SpriteMaterial {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.image.hash(state);
+        self.color.reflect_hash().hash(state);
+        self.flip_x.hash(state);
+        self.flip_y.hash(state);
+        self.custom_size.reflect_hash().hash(state);
+        self.rect.reflect_hash().hash(state);
+        self.image_mode.reflect_hash().hash(state);
+        self.alpha_mode.reflect_hash().hash(state);
+        self.anchor.reflect_hash().hash(state);
+        self.texture_atlas_layout.reflect_hash().hash(state);
+    }
 }
 
 // NOTE: These must match the bit flags in bevy_sprite_render/src/sprite_mesh/sprite_materials.wgsl!
@@ -83,12 +105,17 @@ pub struct SpriteMaterialUniform {
     pub alpha_cutoff: f32,
     pub vertex_scale: Vec2,
     pub vertex_offset: Vec2,
-    pub uv_transform: Mat3,
+    pub uv_scale: Vec2,
+    pub uv_offset: Vec2,
+}
 
-    // tile shader def
+#[derive(ShaderType, Default)]
+pub struct SpriteTileUniform {
     pub tile_stretch_value: Vec2,
+}
 
-    // slice shader def
+#[derive(ShaderType, Default)]
+pub struct SpriteSliceUniform {
     pub scale: Vec2,
     pub min_inset: Vec2,
     pub max_inset: Vec2,
@@ -96,13 +123,66 @@ pub struct SpriteMaterialUniform {
     pub center_stretch_value: Vec2,
 }
 
-impl AsBindGroupShaderType<SpriteMaterialUniform> for SpriteMaterial {
-    fn as_bind_group_shader_type(
+#[derive(ShaderType, Default, Clone)]
+pub struct AtlasLayoutUniform {
+    pub uv_vertex_scale: Vec2,
+    pub uv_offset: Vec2,
+}
+
+impl AsBindGroup for SpriteMaterial {
+    type Data = ();
+    type Param = (SRes<RenderQueue>, SRes<RenderAssets<GpuImage>>);
+
+    fn bind_group_layout_descriptor(render_device: &RenderDevice) -> BindGroupLayoutDescriptor
+    where
+        Self: Sized,
+    {
+        BindGroupLayoutDescriptor::new(
+            "sprite material bind groups",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::all(),
+                (
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    sampler(SamplerBindingType::Filtering),
+                    uniform_buffer::<SpriteMaterialUniform>(false),
+                    uniform_buffer::<SpriteTileUniform>(false),
+                    uniform_buffer::<SpriteSliceUniform>(false),
+                    GpuArrayBuffer::<AtlasLayoutUniform>::binding_layout(&render_device.limits()),
+                ),
+            ),
+        )
+    }
+
+    fn bind_group_layout_entries(
+        render_device: &RenderDevice,
+        _force_no_bindless: bool,
+    ) -> Vec<bevy_render::render_resource::BindGroupLayoutEntry>
+    where
+        Self: Sized,
+    {
+        BindGroupLayoutEntries::sequential(
+            ShaderStages::all(),
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                uniform_buffer::<SpriteMaterialUniform>(false),
+                uniform_buffer::<SpriteTileUniform>(false),
+                uniform_buffer::<SpriteSliceUniform>(false),
+                GpuArrayBuffer::<AtlasLayoutUniform>::binding_layout(&render_device.limits()),
+            ),
+        )
+        .to_vec()
+    }
+
+    fn as_bind_group(
         &self,
-        images: &RenderAssets<bevy_render::texture::GpuImage>,
-    ) -> SpriteMaterialUniform {
+        layout_descriptor: &BindGroupLayoutDescriptor,
+        render_device: &RenderDevice,
+        pipeline_cache: &bevy_render::render_resource::PipelineCache,
+        (render_queue, images): &mut bevy_ecs::system::SystemParamItem<'_, '_, Self::Param>,
+    ) -> Result<PreparedBindGroup, AsBindGroupError> {
         let Some(image) = images.get(self.image.id()) else {
-            return SpriteMaterialUniform::default();
+            return Err(AsBindGroupError::RetryNextUpdate);
         };
 
         let mut flags = SpriteMaterialFlags::NONE;
@@ -127,36 +207,32 @@ impl AsBindGroupShaderType<SpriteMaterialUniform> for SpriteMaterial {
 
         let mut quad_size = image_size;
         let mut quad_offset = Vec2::ZERO;
-        let mut uv_transform = Affine2::default();
+        let mut uv_scale = Vec2::ONE;
+        let mut uv_offset = Vec2::ZERO;
+
+        let mut atlas_layout_uniforms = vec![];
 
         if let Some(texture_atlas_layout) = &self.texture_atlas_layout {
-            let index = self
-                .texture_atlas_index
-                .clamp(0, texture_atlas_layout.textures.len() - 1);
+            quad_size = texture_atlas_layout.size.as_vec2();
+            image_size = quad_size;
 
-            let rect = texture_atlas_layout.textures[index].as_rect();
+            for rect in &texture_atlas_layout.textures {
+                let rect = rect.as_rect();
+                let ratio = rect.size() / quad_size;
 
-            let ratio = rect.size() / image_size;
-
-            uv_transform *= Affine2::from_scale(ratio);
-            uv_transform *= Affine2::from_translation(vec2(
-                rect.min.x / rect.size().y,
-                rect.min.y / rect.size().y,
-            ));
-
-            quad_size = rect.size();
-            image_size = rect.size();
+                atlas_layout_uniforms.push(AtlasLayoutUniform {
+                    uv_vertex_scale: ratio,
+                    uv_offset: vec2(rect.min.x / quad_size.x, rect.min.y / quad_size.y),
+                })
+            }
         }
 
-        // rect selects a slice of the image to render, map the uv and change the quad scale to match the rect
+        // Rect selects a slice of the image to render, map the uv and change the quad scale to match the rect
         if let Some(rect) = self.rect {
             let ratio = rect.size() / image_size;
 
-            uv_transform *= Affine2::from_scale(ratio);
-            uv_transform *= Affine2::from_translation(vec2(
-                rect.min.x / rect.size().x,
-                rect.min.y / rect.size().y,
-            ));
+            uv_scale *= ratio;
+            uv_offset += vec2(rect.min.x / rect.size().x, rect.min.y / rect.size().y);
 
             quad_size = rect.size();
             image_size = rect.size();
@@ -200,22 +276,19 @@ impl AsBindGroupShaderType<SpriteMaterialUniform> for SpriteMaterial {
                         // which is why we need to manipulate the UV.
                         SpriteScalingMode::FillCenter => {
                             let fill_size = fill_size();
-                            uv_transform *= Affine2::from_scale(custom_size / fill_size);
-                            uv_transform *= Affine2::from_translation(
-                                (fill_size - custom_size) * 0.5 / custom_size,
-                            );
+                            uv_scale *= custom_size / fill_size;
+                            uv_offset += (fill_size - custom_size) * 0.5 / custom_size;
                             quad_size = custom_size;
                         }
                         SpriteScalingMode::FillStart => {
                             let fill_size = fill_size();
-                            uv_transform *= Affine2::from_scale(custom_size / fill_size);
+                            uv_scale *= custom_size / fill_size;
                             quad_size = custom_size;
                         }
                         SpriteScalingMode::FillEnd => {
                             let fill_size = fill_size();
-                            uv_transform *= Affine2::from_scale(custom_size / fill_size);
-                            uv_transform *=
-                                Affine2::from_translation((fill_size - custom_size) / custom_size);
+                            uv_scale *= custom_size / fill_size;
+                            uv_offset += (fill_size - custom_size) / custom_size;
                             quad_size = custom_size;
                         }
 
@@ -291,23 +364,99 @@ impl AsBindGroupShaderType<SpriteMaterialUniform> for SpriteMaterial {
 
         quad_offset -= quad_size * self.anchor;
 
-        SpriteMaterialUniform {
+        let sprite_material = SpriteMaterialUniform {
             color: self.color.to_linear().to_vec4(),
             flags: flags.bits(),
             alpha_cutoff,
             vertex_scale: quad_size,
             vertex_offset: quad_offset,
-            uv_transform: uv_transform.into(),
+            uv_scale,
+            uv_offset,
+        };
 
-            tile_stretch_value,
+        let sprite_tile = SpriteTileUniform { tile_stretch_value };
 
+        let sprite_slice = SpriteSliceUniform {
             scale,
             min_inset,
             max_inset,
             side_stretch_value,
             center_stretch_value,
+        };
+
+        let mut material_buffer = UniformBuffer::from(sprite_material);
+        let mut tile_buffer = UniformBuffer::from(sprite_tile);
+        let mut slice_buffer = UniformBuffer::from(sprite_slice);
+        let mut layout_buffer = GpuArrayBuffer::<AtlasLayoutUniform>::new(&render_device.limits());
+
+        // push a dummy value so the binding is created even when not using a texture atlas
+        if atlas_layout_uniforms.is_empty() {
+            layout_buffer.push(AtlasLayoutUniform::default());
         }
+
+        for layout in atlas_layout_uniforms {
+            layout_buffer.push(layout);
+        }
+
+        material_buffer.write_buffer(render_device, render_queue);
+        tile_buffer.write_buffer(render_device, render_queue);
+        slice_buffer.write_buffer(render_device, render_queue);
+        layout_buffer.write_buffer(render_device, render_queue);
+
+        let (Some(material_binding), Some(tile_binding), Some(slice_binding), Some(layout_binding)) = (
+            material_buffer.binding(),
+            tile_buffer.binding(),
+            slice_buffer.binding(),
+            layout_buffer.binding(),
+        ) else {
+            tracing::warn!("Couldn't create SpriteMaterial BindGroup!");
+            return Err(AsBindGroupError::RetryNextUpdate);
+        };
+
+        Ok(PreparedBindGroup {
+            bindings: BindingResources(vec![]),
+            bind_group: render_device.create_bind_group(
+                "sprite material bind group",
+                &pipeline_cache.get_bind_group_layout(&layout_descriptor),
+                &BindGroupEntries::sequential((
+                    &image.texture_view,
+                    &image.sampler,
+                    material_binding,
+                    tile_binding,
+                    slice_binding,
+                    layout_binding,
+                )),
+            ),
+        })
     }
+
+    fn label() -> &'static str {
+        "sprite material bind groups"
+    }
+
+    fn bind_group_data(&self) -> Self::Data {
+        ()
+    }
+
+    fn unprepared_bind_group(
+        &self,
+        _layout: &bevy_render::render_resource::BindGroupLayout,
+        _render_device: &RenderDevice,
+        _images: &mut bevy_ecs::system::SystemParamItem<'_, '_, Self::Param>,
+        _force_no_bindless: bool,
+    ) -> Result<UnpreparedBindGroup, AsBindGroupError> {
+        Err(AsBindGroupError::CreateBindGroupDirectly)
+    }
+}
+
+pub struct TextureAtlasLayoutUniform {
+    pub layouts: Vec<TextureAtlasTransform>,
+}
+
+#[derive(Default, ShaderType)]
+pub struct TextureAtlasTransform {
+    pub vertex_scale: Vec2,
+    pub uv_transform: Mat3,
 }
 
 impl Material2d for SpriteMaterial {
@@ -343,7 +492,6 @@ impl SpriteMaterial {
 
         SpriteMaterial {
             image: sprite.image,
-            texture_atlas: sprite.texture_atlas,
             color: sprite.color,
             flip_x: sprite.flip_x,
             flip_y: sprite.flip_y,
@@ -352,7 +500,6 @@ impl SpriteMaterial {
             image_mode: sprite.image_mode,
             alpha_mode,
             texture_atlas_layout: None,
-            texture_atlas_index: 0,
             anchor: Vec2::ZERO,
         }
     }
